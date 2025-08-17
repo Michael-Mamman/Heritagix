@@ -9,6 +9,10 @@
 (define-constant ERR_INVALID_MEDIA_TYPE (err u107))
 (define-constant ERR_MEDIA_SIZE_EXCEEDED (err u108))
 (define-constant ERR_ACCESS_DENIED (err u109))
+(define-constant ERR_EVENT_NOT_FOUND (err u110))
+(define-constant ERR_EVENT_ALREADY_EXISTS (err u111))
+(define-constant ERR_INVALID_DATE (err u112))
+(define-constant ERR_INVALID_EVENT_TYPE (err u113))
 
 (define-data-var next-heritage-id uint u1)
 (define-data-var registration-fee uint u1000000)
@@ -16,6 +20,8 @@
 (define-data-var next-media-id uint u1)
 (define-data-var media-upload-fee uint u100000)
 (define-data-var max-media-size uint u10485760)
+(define-data-var next-event-id uint u1)
+(define-data-var event-submission-fee uint u50000)
 
 (define-map heritage-registry
   uint
@@ -111,6 +117,60 @@
 (define-map user-media-uploads
   principal
   (list 30 uint)
+)
+
+(define-map historical-events
+  uint
+  {
+    heritage-id: uint,
+    event-title: (string-ascii 100),
+    event-description: (string-ascii 500),
+    event-date: uint,
+    event-type: (string-ascii 30),
+    historical-period: (string-ascii 50),
+    significance-level: uint,
+    submitter: principal,
+    verified: bool,
+    verifier: (optional principal),
+    submission-timestamp: uint,
+    source-references: (list 5 (string-ascii 200)),
+    related-events: (list 10 uint)
+  }
+)
+
+(define-map heritage-timeline
+  uint
+  (list 100 uint)
+)
+
+(define-map events-by-period
+  (string-ascii 50)
+  (list 200 uint)
+)
+
+(define-map events-by-type
+  (string-ascii 30)
+  (list 150 uint)
+)
+
+(define-map user-event-submissions
+  principal
+  (list 50 uint)
+)
+
+(define-map event-verification-votes
+  uint
+  {
+    support-votes: uint,
+    dispute-votes: uint,
+    voters: (list 50 principal),
+    consensus-reached: bool
+  }
+)
+
+(define-map chronological-index
+  {heritage-id: uint, date-range: (string-ascii 20)}
+  (list 50 uint)
 )
 
 (define-public (register-heritage (title (string-ascii 100)) (description (string-ascii 500)) (location (string-ascii 100)) (category (string-ascii 50)) (cultural-significance uint))
@@ -558,3 +618,254 @@
 (define-read-only (can-access-media (media-id uint) (user principal))
   (check-media-access media-id user)
 )
+
+(define-public (submit-historical-event (heritage-id uint) (event-title (string-ascii 100)) (event-description (string-ascii 500)) (event-date uint) (event-type (string-ascii 30)) (historical-period (string-ascii 50)) (significance-level uint) (source-references (list 5 (string-ascii 200))) (related-events (list 10 uint)))
+  (let
+    (
+      (event-id (var-get next-event-id))
+      (submission-fee (var-get event-submission-fee))
+      (heritage (unwrap! (map-get? heritage-registry heritage-id) ERR_NOT_FOUND))
+    )
+    (asserts! (> (len event-title) u0) ERR_INVALID_INPUT)
+    (asserts! (> (len event-description) u0) ERR_INVALID_INPUT)
+    (asserts! (> (len event-type) u0) ERR_INVALID_INPUT)
+    (asserts! (> (len historical-period) u0) ERR_INVALID_INPUT)
+    (asserts! (<= significance-level u10) ERR_INVALID_INPUT)
+    (asserts! (> event-date u0) ERR_INVALID_DATE)
+    (asserts! (<= event-date stacks-block-height) ERR_INVALID_DATE)
+    (asserts! (or (is-eq event-type "construction") (is-eq event-type "destruction") (is-eq event-type "renovation") (is-eq event-type "discovery") (is-eq event-type "cultural") (is-eq event-type "political") (is-eq event-type "natural") (is-eq event-type "archaeological")) ERR_INVALID_EVENT_TYPE)
+    (asserts! (>= (stx-get-balance tx-sender) submission-fee) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (stx-transfer? submission-fee tx-sender CONTRACT_OWNER))
+    
+    (map-set historical-events event-id
+      {
+        heritage-id: heritage-id,
+        event-title: event-title,
+        event-description: event-description,
+        event-date: event-date,
+        event-type: event-type,
+        historical-period: historical-period,
+        significance-level: significance-level,
+        submitter: tx-sender,
+        verified: false,
+        verifier: none,
+        submission-timestamp: stacks-block-height,
+        source-references: source-references,
+        related-events: related-events
+      }
+    )
+    
+    (map-set heritage-timeline heritage-id
+      (unwrap-panic (as-max-len? (append (default-to (list) (map-get? heritage-timeline heritage-id)) event-id) u100))
+    )
+    
+    (map-set events-by-period historical-period
+      (unwrap-panic (as-max-len? (append (default-to (list) (map-get? events-by-period historical-period)) event-id) u200))
+    )
+    
+    (map-set events-by-type event-type
+      (unwrap-panic (as-max-len? (append (default-to (list) (map-get? events-by-type event-type)) event-id) u150))
+    )
+    
+    (map-set user-event-submissions tx-sender
+      (unwrap-panic (as-max-len? (append (default-to (list) (map-get? user-event-submissions tx-sender)) event-id) u50))
+    )
+    
+    (map-set event-verification-votes event-id
+      {
+        support-votes: u0,
+        dispute-votes: u0,
+        voters: (list),
+        consensus-reached: false
+      }
+    )
+    
+    (update-chronological-index heritage-id event-date event-id)
+    (var-set next-event-id (+ event-id u1))
+    (ok event-id)
+  )
+)
+
+(define-public (verify-historical-event (event-id uint))
+  (let
+    (
+      (event (unwrap! (map-get? historical-events event-id) ERR_EVENT_NOT_FOUND))
+      (heritage (unwrap! (map-get? heritage-registry (get heritage-id event)) ERR_NOT_FOUND))
+    )
+    (asserts! (not (is-eq tx-sender (get submitter event))) ERR_UNAUTHORIZED)
+    (asserts! (not (get verified event)) ERR_ALREADY_EXISTS)
+    (asserts! (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender (get submitter heritage)) (>= (get reputation-score (default-to {submissions: u0, verifications: u0, reputation-score: u0} (map-get? user-reputation tx-sender))) u100)) ERR_UNAUTHORIZED)
+    
+    (map-set historical-events event-id
+      (merge event {
+        verified: true,
+        verifier: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (vote-on-event (event-id uint) (support bool))
+  (let
+    (
+      (event (unwrap! (map-get? historical-events event-id) ERR_EVENT_NOT_FOUND))
+      (current-votes (default-to {support-votes: u0, dispute-votes: u0, voters: (list), consensus-reached: false} (map-get? event-verification-votes event-id)))
+      (voters (get voters current-votes))
+    )
+    (asserts! (is-none (index-of voters tx-sender)) ERR_ALREADY_EXISTS)
+    (asserts! (not (get consensus-reached current-votes)) ERR_ALREADY_EXISTS)
+    
+    (let
+      (
+        (new-support-votes (if support (+ (get support-votes current-votes) u1) (get support-votes current-votes)))
+        (new-dispute-votes (if support (get dispute-votes current-votes) (+ (get dispute-votes current-votes) u1)))
+        (total-votes (+ new-support-votes new-dispute-votes))
+        (consensus-threshold u10)
+      )
+      (map-set event-verification-votes event-id
+        {
+          support-votes: new-support-votes,
+          dispute-votes: new-dispute-votes,
+          voters: (unwrap-panic (as-max-len? (append voters tx-sender) u50)),
+          consensus-reached: (>= total-votes consensus-threshold)
+        }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (link-related-events (primary-event-id uint) (related-event-id uint))
+  (let
+    (
+      (primary-event (unwrap! (map-get? historical-events primary-event-id) ERR_EVENT_NOT_FOUND))
+      (related-event (unwrap! (map-get? historical-events related-event-id) ERR_EVENT_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get submitter primary-event)) (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get heritage-id primary-event) (get heritage-id related-event)) ERR_INVALID_INPUT)
+    
+    (let
+      (
+        (current-related (get related-events primary-event))
+      )
+      (asserts! (is-none (index-of current-related related-event-id)) ERR_ALREADY_EXISTS)
+      
+      (map-set historical-events primary-event-id
+        (merge primary-event {
+          related-events: (unwrap-panic (as-max-len? (append current-related related-event-id) u10))
+        })
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (update-event-significance (event-id uint) (new-significance uint))
+  (let
+    (
+      (event (unwrap! (map-get? historical-events event-id) ERR_EVENT_NOT_FOUND))
+    )
+    (asserts! (or (is-eq tx-sender (get submitter event)) (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
+    (asserts! (<= new-significance u10) ERR_INVALID_INPUT)
+    
+    (map-set historical-events event-id
+      (merge event {significance-level: new-significance})
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-event-submission-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set event-submission-fee new-fee)
+    (ok true)
+  )
+)
+
+(define-private (update-chronological-index (heritage-id uint) (event-date uint) (event-id uint))
+  (let
+    (
+      (date-range (get-date-range event-date))
+      (index-key {heritage-id: heritage-id, date-range: date-range})
+      (current-events (default-to (list) (map-get? chronological-index index-key)))
+    )
+    (map-set chronological-index index-key
+      (unwrap-panic (as-max-len? (append current-events event-id) u50))
+    )
+  )
+)
+
+(define-private (get-date-range (event-date uint))
+  (if (<= event-date u100000)
+    "ancient"
+    (if (<= event-date u500000)
+      "classical"
+      (if (<= event-date u1000000)
+        "medieval"
+        (if (<= event-date u1500000)
+          "renaissance"
+          (if (<= event-date u2000000)
+            "modern"
+            "contemporary"
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-historical-event (event-id uint))
+  (map-get? historical-events event-id)
+)
+
+(define-read-only (get-heritage-timeline (heritage-id uint))
+  (map-get? heritage-timeline heritage-id)
+)
+
+(define-read-only (get-events-by-period (historical-period (string-ascii 50)))
+  (map-get? events-by-period historical-period)
+)
+
+(define-read-only (get-events-by-type (event-type (string-ascii 30)))
+  (map-get? events-by-type event-type)
+)
+
+(define-read-only (get-user-event-submissions (user principal))
+  (map-get? user-event-submissions user)
+)
+
+(define-read-only (get-event-verification-votes (event-id uint))
+  (map-get? event-verification-votes event-id)
+)
+
+(define-read-only (get-chronological-events (heritage-id uint) (date-range (string-ascii 20)))
+  (map-get? chronological-index {heritage-id: heritage-id, date-range: date-range})
+)
+
+(define-read-only (get-event-submission-fee)
+  (var-get event-submission-fee)
+)
+
+(define-read-only (get-next-event-id)
+  (var-get next-event-id)
+)
+
+(define-read-only (get-timeline-summary (heritage-id uint))
+  (let
+    (
+      (timeline (default-to (list) (map-get? heritage-timeline heritage-id)))
+      (total-events (len timeline))
+    )
+    (ok {
+      total-events: total-events,
+      timeline-events: timeline
+    })
+  )
+)
+
+
+
+
