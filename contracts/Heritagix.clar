@@ -13,6 +13,11 @@
 (define-constant ERR_EVENT_ALREADY_EXISTS (err u111))
 (define-constant ERR_INVALID_DATE (err u112))
 (define-constant ERR_INVALID_EVENT_TYPE (err u113))
+(define-constant ERR_FUND_NOT_FOUND (err u114))
+(define-constant ERR_FUND_ALREADY_EXISTS (err u115))
+(define-constant ERR_FUND_CLOSED (err u116))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u117))
+(define-constant ERR_MILESTONE_COMPLETED (err u118))
 
 (define-data-var next-heritage-id uint u1)
 (define-data-var registration-fee uint u1000000)
@@ -22,6 +27,8 @@
 (define-data-var max-media-size uint u10485760)
 (define-data-var next-event-id uint u1)
 (define-data-var event-submission-fee uint u50000)
+(define-data-var next-fund-id uint u1)
+(define-data-var fund-creation-fee uint u500000)
 
 (define-map heritage-registry
   uint
@@ -171,6 +178,53 @@
 (define-map chronological-index
   {heritage-id: uint, date-range: (string-ascii 20)}
   (list 50 uint)
+)
+
+;; Heritage Conservation Fund System
+(define-map conservation-funds
+  uint
+  {
+    heritage-id: uint,
+    fund-title: (string-ascii 100),
+    fund-description: (string-ascii 300),
+    target-amount: uint,
+    current-amount: uint,
+    fund-creator: principal,
+    created-at: uint,
+    deadline: uint,
+    status: (string-ascii 20), ;; "active", "completed", "expired"
+    milestones-count: uint,
+    current-milestone: uint
+  }
+)
+
+(define-map fund-contributions
+  {fund-id: uint, contributor: principal}
+  {
+    amount: uint,
+    contributed-at: uint
+  }
+)
+
+(define-map fund-milestones
+  {fund-id: uint, milestone-id: uint}
+  {
+    milestone-title: (string-ascii 100),
+    required-amount: uint,
+    completed: bool,
+    completion-date: (optional uint),
+    evidence-hash: (optional (string-ascii 64))
+  }
+)
+
+(define-map heritage-fund-list
+  uint
+  (list 10 uint)
+)
+
+(define-map user-contributions
+  principal
+  (list 50 {fund-id: uint, amount: uint})
 )
 
 (define-public (register-heritage (title (string-ascii 100)) (description (string-ascii 500)) (location (string-ascii 100)) (category (string-ascii 50)) (cultural-significance uint))
@@ -863,6 +917,341 @@
       total-events: total-events,
       timeline-events: timeline
     })
+  )
+)
+
+;; Heritage Conservation Fund Functions
+(define-public (create-conservation-fund (heritage-id uint) (fund-title (string-ascii 100)) (fund-description (string-ascii 300)) (target-amount uint) (deadline uint) (milestones (list 5 {title: (string-ascii 100), amount: uint})))
+  (let
+    (
+      (fund-id (var-get next-fund-id))
+      (creation-fee (var-get fund-creation-fee))
+      (heritage (unwrap! (map-get? heritage-registry heritage-id) ERR_NOT_FOUND))
+    )
+    (asserts! (> (len fund-title) u0) ERR_INVALID_INPUT)
+    (asserts! (> (len fund-description) u0) ERR_INVALID_INPUT)
+    (asserts! (> target-amount u0) ERR_INVALID_INPUT)
+    (asserts! (> deadline stacks-block-height) ERR_INVALID_INPUT)
+    (asserts! (> (len milestones) u0) ERR_INVALID_INPUT)
+    (asserts! (<= (len milestones) u5) ERR_INVALID_INPUT)
+    (asserts! (>= (stx-get-balance tx-sender) creation-fee) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (get verified heritage) ERR_UNAUTHORIZED)
+    
+    (try! (stx-transfer? creation-fee tx-sender CONTRACT_OWNER))
+    
+    (map-set conservation-funds fund-id
+      {
+        heritage-id: heritage-id,
+        fund-title: fund-title,
+        fund-description: fund-description,
+        target-amount: target-amount,
+        current-amount: u0,
+        fund-creator: tx-sender,
+        created-at: stacks-block-height,
+        deadline: deadline,
+        status: "active",
+        milestones-count: (len milestones),
+        current-milestone: u1
+      }
+    )
+    
+    (map-set heritage-fund-list heritage-id
+      (unwrap-panic (as-max-len? (append (default-to (list) (map-get? heritage-fund-list heritage-id)) fund-id) u10))
+    )
+    
+    (try! (setup-fund-milestones fund-id milestones))
+    (var-set next-fund-id (+ fund-id u1))
+    (ok fund-id)
+  )
+)
+
+(define-public (contribute-to-fund (fund-id uint) (amount uint))
+  (let
+    (
+      (fund (unwrap! (map-get? conservation-funds fund-id) ERR_FUND_NOT_FOUND))
+      (existing-contribution (map-get? fund-contributions {fund-id: fund-id, contributor: tx-sender}))
+    )
+    (asserts! (> amount u0) ERR_INVALID_INPUT)
+    (asserts! (is-eq (get status fund) "active") ERR_FUND_CLOSED)
+    (asserts! (< stacks-block-height (get deadline fund)) ERR_FUND_CLOSED)
+    (asserts! (>= (stx-get-balance tx-sender) amount) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (match existing-contribution
+      existing-contrib
+      (map-set fund-contributions {fund-id: fund-id, contributor: tx-sender}
+        {
+          amount: (+ (get amount existing-contrib) amount),
+          contributed-at: (get contributed-at existing-contrib)
+        }
+      )
+      (map-set fund-contributions {fund-id: fund-id, contributor: tx-sender}
+        {
+          amount: amount,
+          contributed-at: stacks-block-height
+        }
+      )
+    )
+    
+    (map-set conservation-funds fund-id
+      (merge fund {
+        current-amount: (+ (get current-amount fund) amount)
+      })
+    )
+    
+    (unwrap-panic (update-user-contribution-list tx-sender fund-id amount))
+    (unwrap-panic (check-milestone-completion fund-id))
+    (ok true)
+  )
+)
+
+(define-public (complete-milestone (fund-id uint) (milestone-id uint) (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (fund (unwrap! (map-get? conservation-funds fund-id) ERR_FUND_NOT_FOUND))
+      (milestone (unwrap! (map-get? fund-milestones {fund-id: fund-id, milestone-id: milestone-id}) ERR_MILESTONE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get fund-creator fund)) ERR_UNAUTHORIZED)
+    (asserts! (not (get completed milestone)) ERR_MILESTONE_COMPLETED)
+    (asserts! (is-eq milestone-id (get current-milestone fund)) ERR_INVALID_INPUT)
+    (asserts! (> (len evidence-hash) u0) ERR_INVALID_INPUT)
+    
+    (map-set fund-milestones {fund-id: fund-id, milestone-id: milestone-id}
+      (merge milestone {
+        completed: true,
+        completion-date: (some stacks-block-height),
+        evidence-hash: (some evidence-hash)
+      })
+    )
+    
+    (map-set conservation-funds fund-id
+      (merge fund {
+        current-milestone: (+ (get current-milestone fund) u1)
+      })
+    )
+    
+    (if (is-eq milestone-id (get milestones-count fund))
+      (map-set conservation-funds fund-id
+        (merge fund {status: "completed"})
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (withdraw-fund-excess (fund-id uint))
+  (let
+    (
+      (fund (unwrap! (map-get? conservation-funds fund-id) ERR_FUND_NOT_FOUND))
+      (excess-amount (if (> (get current-amount fund) (get target-amount fund))
+                      (- (get current-amount fund) (get target-amount fund))
+                      u0))
+    )
+    (asserts! (is-eq tx-sender (get fund-creator fund)) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq (get status fund) "completed") (> stacks-block-height (get deadline fund))) ERR_FUND_CLOSED)
+    (asserts! (> excess-amount u0) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? excess-amount tx-sender (get fund-creator fund))))
+    
+    (map-set conservation-funds fund-id
+      (merge fund {
+        current-amount: (get target-amount fund)
+      })
+    )
+    (ok excess-amount)
+  )
+)
+
+(define-public (refund-expired-fund (fund-id uint))
+  (let
+    (
+      (fund (unwrap! (map-get? conservation-funds fund-id) ERR_FUND_NOT_FOUND))
+      (contribution (unwrap! (map-get? fund-contributions {fund-id: fund-id, contributor: tx-sender}) ERR_NOT_FOUND))
+      (refund-amount (get amount contribution))
+    )
+    (asserts! (> stacks-block-height (get deadline fund)) ERR_FUND_CLOSED)
+    (asserts! (not (is-eq (get status fund) "completed")) ERR_FUND_CLOSED)
+    (asserts! (> refund-amount u0) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? refund-amount tx-sender tx-sender)))
+    
+    (map-delete fund-contributions {fund-id: fund-id, contributor: tx-sender})
+    
+    (map-set conservation-funds fund-id
+      (merge fund {
+        current-amount: (- (get current-amount fund) refund-amount),
+        status: "expired"
+      })
+    )
+    (ok refund-amount)
+  )
+)
+
+(define-public (set-fund-creation-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set fund-creation-fee new-fee)
+    (ok true)
+  )
+)
+
+(define-private (setup-fund-milestones (fund-id uint) (milestones (list 5 {title: (string-ascii 100), amount: uint})))
+  (let
+    (
+      (setup-result (fold setup-milestone-helper milestones {fund-id: fund-id, milestone-id: u1, success: true}))
+    )
+    (if (get success setup-result)
+      (ok true)
+      ERR_INVALID_INPUT
+    )
+  )
+)
+
+(define-private (setup-milestone-helper (milestone {title: (string-ascii 100), amount: uint}) (acc {fund-id: uint, milestone-id: uint, success: bool}))
+  (if (get success acc)
+    (begin
+      (map-set fund-milestones {fund-id: (get fund-id acc), milestone-id: (get milestone-id acc)}
+        {
+          milestone-title: (get title milestone),
+          required-amount: (get amount milestone),
+          completed: false,
+          completion-date: none,
+          evidence-hash: none
+        }
+      )
+      {fund-id: (get fund-id acc), milestone-id: (+ (get milestone-id acc) u1), success: true}
+    )
+    acc
+  )
+)
+
+(define-private (update-user-contribution-list (contributor principal) (fund-id uint) (amount uint))
+  (let
+    (
+      (current-contributions (default-to (list) (map-get? user-contributions contributor)))
+      (existing-entry (get found (find-contribution-entry fund-id current-contributions)))
+    )
+    (match existing-entry
+      entry
+      (let
+        (
+          (updated-contributions (map update-contribution-amount current-contributions))
+        )
+        (map-set user-contributions contributor updated-contributions)
+        (ok true)
+      )
+      (let
+        (
+          (new-entry {fund-id: fund-id, amount: amount})
+          (updated-contributions (unwrap-panic (as-max-len? (append current-contributions new-entry) u50)))
+        )
+        (map-set user-contributions contributor updated-contributions)
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (find-contribution-entry (target-fund-id uint) (contributions (list 50 {fund-id: uint, amount: uint})))
+  (fold find-contribution-helper contributions {target-fund-id: target-fund-id, found: none})
+)
+
+(define-private (find-contribution-helper (contribution {fund-id: uint, amount: uint}) (acc {target-fund-id: uint, found: (optional {fund-id: uint, amount: uint})}))
+  (if (is-eq (get fund-id contribution) (get target-fund-id acc))
+    {target-fund-id: (get target-fund-id acc), found: (some contribution)}
+    acc
+  )
+)
+
+(define-private (update-contribution-amount (contribution {fund-id: uint, amount: uint}))
+  contribution
+)
+
+(define-private (check-milestone-completion (fund-id uint))
+  (let
+    (
+      (fund (unwrap! (map-get? conservation-funds fund-id) ERR_FUND_NOT_FOUND))
+      (current-milestone-id (get current-milestone fund))
+      (milestone (map-get? fund-milestones {fund-id: fund-id, milestone-id: current-milestone-id}))
+    )
+    (match milestone
+      milestone-data
+      (if (and (not (get completed milestone-data)) (>= (get current-amount fund) (get required-amount milestone-data)))
+        (ok true)
+        (ok false)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-read-only (get-conservation-fund (fund-id uint))
+  (map-get? conservation-funds fund-id)
+)
+
+(define-read-only (get-fund-contribution (fund-id uint) (contributor principal))
+  (map-get? fund-contributions {fund-id: fund-id, contributor: contributor})
+)
+
+(define-read-only (get-fund-milestone (fund-id uint) (milestone-id uint))
+  (map-get? fund-milestones {fund-id: fund-id, milestone-id: milestone-id})
+)
+
+(define-read-only (get-heritage-funds (heritage-id uint))
+  (map-get? heritage-fund-list heritage-id)
+)
+
+(define-read-only (get-user-contributions (contributor principal))
+  (map-get? user-contributions contributor)
+)
+
+(define-read-only (get-fund-creation-fee)
+  (var-get fund-creation-fee)
+)
+
+(define-read-only (get-next-fund-id)
+  (var-get next-fund-id)
+)
+
+(define-read-only (get-fund-progress (fund-id uint))
+  (match (map-get? conservation-funds fund-id)
+    fund-data
+    (ok {
+      progress-percentage: (if (> (get target-amount fund-data) u0)
+                            (/ (* (get current-amount fund-data) u100) (get target-amount fund-data))
+                            u0),
+      current-amount: (get current-amount fund-data),
+      target-amount: (get target-amount fund-data),
+      status: (get status fund-data),
+      current-milestone: (get current-milestone fund-data),
+      total-milestones: (get milestones-count fund-data)
+    })
+    ERR_FUND_NOT_FOUND
+  )
+)
+
+(define-read-only (get-fund-statistics (fund-id uint))
+  (match (map-get? conservation-funds fund-id)
+    fund-data
+    (let
+      (
+        (days-remaining (if (> (get deadline fund-data) stacks-block-height)
+                         (- (get deadline fund-data) stacks-block-height)
+                         u0))
+        (is-active (is-eq (get status fund-data) "active"))
+      )
+      (ok {
+        fund-data: fund-data,
+        days-remaining: days-remaining,
+        is-expired: (and is-active (is-eq days-remaining u0)),
+        funding-rate: (if (> (- stacks-block-height (get created-at fund-data)) u0)
+                       (/ (get current-amount fund-data) (- stacks-block-height (get created-at fund-data)))
+                       u0)
+      })
+    )
+    ERR_FUND_NOT_FOUND
   )
 )
 
